@@ -6,7 +6,7 @@ import { cached, cachedBy } from "../core/cached.ts";
 import { type Logger, silentLogger } from "../core/logger.ts";
 import { COMMANDS_TTL_MS, inEmptyDir, type PiAgent, type PiBackend } from "./agent.ts";
 import type { PiModel } from "./models.ts";
-import { childrenOf, newChildren, type ProcessTable, readProcessTable } from "./processes.ts";
+import { type BackgroundProcess, childrenOf, newChildren, type ProcessTable, readProcessTable } from "./processes.ts";
 import { connectRpcAgent, type RpcAgent } from "./rpc-agent.ts";
 import { type RpcProcess, spawnRpcProcess } from "./rpc-process.ts";
 
@@ -78,7 +78,7 @@ export class RpcBackend implements PiBackend {
 		});
 		// The baseline is taken once pi has answered its first commands, so the
 		// helpers it starts at startup are in it.
-		const background = Promise.withResolvers<() => Promise<number[]>>();
+		const background = Promise.withResolvers<() => Promise<BackgroundProcess[]>>();
 		const agent = await connectRpcAgent(channel, this.#logger, {
 			backgroundProcesses: async () => (await background.promise)(),
 		});
@@ -92,19 +92,19 @@ export class RpcBackend implements PiBackend {
 	 * Returns a check for processes pi started after it became ready. Children
 	 * that exist once pi answers its first commands (MCP servers and other
 	 * extension helpers started with pi) are the baseline and don't count.
-	 * If the process table cannot be read, pi always counts as busy.
+	 * Without a baseline the check always rejects, so pi counts as busy.
 	 */
-	async #backgroundProcesses(pid: number): Promise<() => Promise<number[]>> {
+	async #backgroundProcesses(pid: number): Promise<() => Promise<BackgroundProcess[]>> {
 		const read = this.#options.processTable ?? readProcessTable;
 		try {
 			const baseline = childrenOf(await read(), pid);
 			return async () => newChildren(await read(), pid, baseline);
 		} catch (error) {
-			this.#logger.debug("could not read the process table", {
-				pid,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			return async () => [pid];
+			const message = error instanceof Error ? error.message : String(error);
+			this.#logger.debug("could not read the process table", { pid, error: message });
+			return async () => {
+				throw new Error(`no process baseline for pi ${pid}: ${message}`);
+			};
 		}
 	}
 

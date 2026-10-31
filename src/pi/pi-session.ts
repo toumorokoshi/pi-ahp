@@ -23,6 +23,7 @@ import type { StateStore } from "../core/state-store.ts";
 import { chatUri, fileUri, PROVIDER, pathFromFileUri, sessionUri } from "../core/uris.ts";
 import type { ArchiveStore } from "../host/archive-store.ts";
 import type { ImageInput, PiAgent, PiBackend, PiEvent, PromptInput } from "./agent.ts";
+import { backgroundWorkActions, backgroundWorkMeta } from "./background-work.ts";
 import {
 	referencedSkills,
 	skillBlocks,
@@ -35,6 +36,7 @@ import {
 import { turnsFromEntries, userMessageText } from "./history.ts";
 import { type IdleState, suspendBlocker } from "./idle.ts";
 import { parseModelSelection, thinkingLevelOf } from "./models.ts";
+import type { BackgroundProcess } from "./processes.ts";
 import { recordedUserTurns } from "./truncation.ts";
 import { TurnMapper, type TurnOutcome } from "./turn-mapper.ts";
 
@@ -252,6 +254,7 @@ export class PiSession {
 			workingDirectories: [fileUri(this.cwd)],
 			...(session?.chats ? { chats: session.chats } : {}),
 			...(chat?.activity ? { activity: chat.activity } : {}),
+			...(chat?.backgroundWork?.length ? { _meta: backgroundWorkMeta(chat.backgroundWork.length) } : {}),
 		};
 	}
 
@@ -462,11 +465,12 @@ export class PiSession {
 		const pending = this.#agent;
 		const agent = await pending?.catch(() => undefined);
 		if (!agent || this.#agent !== pending || suspendBlocker(this.idleState(agent), cutoff)) return false;
-		const background = await (agent.backgroundProcesses?.() ?? Promise.resolve([])).catch(() => [-1]);
-		if (background.length > 0) {
+		// A process table that cannot be read counts as busy.
+		const background = await (agent.backgroundProcesses?.() ?? Promise.resolve([])).catch(() => undefined);
+		if (!background || background.length > 0) {
 			this.#ctx.logger.debug("idle session kept (background processes)", {
 				session: this.id,
-				pids: background.join(","),
+				pids: background ? background.map((process) => process.pid).join(",") : "unknown",
 			});
 			return false;
 		}
@@ -475,7 +479,50 @@ export class PiSession {
 		this.#agent = undefined;
 		await agent.dispose();
 		this.#reopenSessionFile();
+		this.#applyBackgroundWork([]);
 		return true;
+	}
+
+	/**
+	 * Publishes the processes the session's pi started in the background as
+	 * the chat's background work (`chat/backgroundWorkSet` and
+	 * `chat/backgroundWorkRemoved`), and their count in the summary's
+	 * `_meta`. Only reads an agent that is already running: it never starts
+	 * pi. Without one (pi stopped, embedded or a pi terminal) the entries are
+	 * cleared. A process table that cannot be read leaves them as they are.
+	 */
+	async refreshBackgroundWork(): Promise<void> {
+		const pending = this.#agent;
+		const agent = await pending?.catch(() => undefined);
+		if (!agent || agent.closed || !agent.backgroundProcesses) {
+			this.#applyBackgroundWork([]);
+			return;
+		}
+		let processes: BackgroundProcess[];
+		try {
+			processes = await agent.backgroundProcesses();
+		} catch {
+			return;
+		}
+		// The agent may have been stopped or replaced while `ps` ran.
+		if (this.#agent === pending && !agent.closed) this.#applyBackgroundWork(processes);
+	}
+
+	#applyBackgroundWork(processes: readonly BackgroundProcess[]): void {
+		const chat = this.#ctx.store.chat(this.id);
+		if (!chat) return;
+		const before = chat.backgroundWork?.length ?? 0;
+		const actions = backgroundWorkActions(chat.backgroundWork ?? [], {
+			processes,
+			running: this.idleState(undefined).running,
+			now: new Date(this.#ctx.now()).toISOString(),
+		});
+		for (const action of actions) this.#dispatchChat(action);
+		const after = this.#ctx.store.chat(this.id)?.backgroundWork?.length ?? 0;
+		if (after !== before) {
+			this.#ctx.logger.debug("background work changed", { session: this.id, count: after });
+			this.#ctx.summaryChanged(this.id, { _meta: backgroundWorkMeta(after) });
+		}
 	}
 
 	async dispose(): Promise<void> {

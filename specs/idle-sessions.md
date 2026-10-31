@@ -38,7 +38,9 @@ pi also has children that are always there: MCP servers and other helpers that e
 2. `backgroundProcesses()` reads the table again and returns pi's children that are not in the baseline.
 3. A session with any such process is kept.
 
-The process table comes from `ps -A -o pid=,ppid=` (Linux and macOS). Parsing and comparison are pure functions. If the table cannot be read, the session always counts as busy, so a failure never stops a process that might be working.
+The process table comes from `ps -A -o pid=,ppid=,args=` (Linux and macOS). Parsing and comparison are pure functions. If the table cannot be read, `backgroundProcesses()` rejects and the session counts as busy, so a failure never stops a process that might be working.
+
+The same processes, with their command lines, are published as the chat's background work; see [background-work.md](background-work.md).
 
 ### Suspending (`PiSession.suspend`)
 

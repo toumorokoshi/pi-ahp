@@ -9,6 +9,7 @@ import { BridgeServer, HostAlreadyRunningError } from "../host/bridges.ts";
 import { type PiDirs, piDirsEnv, resolvePiDirs } from "../host/pi-dirs.ts";
 import { loadSettings, migrateSettings, saveSettings, settingsPath } from "../host/settings.ts";
 import { PI_MODES, type PiBackend, type PiMode, parsePiMode } from "../pi/agent.ts";
+import { BACKGROUND_WORK_INTERVAL_MS } from "../pi/background-work.ts";
 import { EmbeddedBackend } from "../pi/embedded-backend.ts";
 import { DEFAULT_IDLE_TIMEOUT_MINUTES, parseIdleTimeout } from "../pi/idle.ts";
 import { RpcBackend } from "../pi/rpc-backend.ts";
@@ -124,6 +125,7 @@ async function main(): Promise<void> {
 		backend,
 		archive,
 		idleTimeoutMs,
+		backgroundWorkIntervalMs: piMode === "rpc" ? BACKGROUND_WORK_INTERVAL_MS : 0,
 		defaultDirectory: values.cwd ?? process.cwd(),
 		serverVersion: packageVersion(),
 		logger,

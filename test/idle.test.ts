@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,8 +10,15 @@ import { type SessionInfo, SessionManager } from "@earendil-works/pi-coding-agen
 import { silentLogger } from "../src/core/logger.ts";
 import { AgentHost } from "../src/host/agent-host.ts";
 import type { PiAgent, PiBackend } from "../src/pi/agent.ts";
+import { BACKGROUND_WORK_META } from "../src/pi/background-work.ts";
 import { parseIdleTimeout, suspendBlocker, sweepInterval } from "../src/pi/idle.ts";
-import { childrenOf, newChildren, parseProcessTable } from "../src/pi/processes.ts";
+import {
+	type BackgroundProcess,
+	childrenOf,
+	newChildren,
+	parseProcessTable,
+	readProcessTable,
+} from "../src/pi/processes.ts";
 import { connectRpcAgent } from "../src/pi/rpc-agent.ts";
 import { type Listener, listen } from "../src/transport/websocket.ts";
 import { FakePi, runEvents } from "./fake-pi.ts";
@@ -43,11 +52,30 @@ describe("idle helpers", () => {
 		assert.equal(suspendBlocker({ ...idle, suspendable: false }, 100), "not suspendable");
 	});
 
-	test("finds children started after the baseline", () => {
-		const table = parseProcessTable("  1     0\n 10     1\n 11    10\n 12    10\nnot a line\n 13    11\n");
+	test("finds children started after the baseline, with their command lines", () => {
+		const table = parseProcessTable(
+			"  1     0 /sbin/init\n 10     1 pi --mode rpc\n 11    10 mcp-server\n 12    10 npm run  dev\nnot a line\n 13    11\n",
+		);
 		assert.deepEqual([...childrenOf(table, 10)], [11, 12]);
-		assert.deepEqual(newChildren(table, 10, new Set([11])), [12]);
+		assert.deepEqual(newChildren(table, 10, new Set([11])), [{ pid: 12, command: "npm run  dev" }]);
 		assert.deepEqual(newChildren(table, 10, new Set([11, 12])), []);
+		assert.deepEqual(newChildren(table, 11, new Set()), [{ pid: 13, command: "" }]);
+	});
+
+	test("reads this process's children from the real process table", async () => {
+		const baseline = childrenOf(await readProcessTable(), process.pid);
+		const child = spawn("sleep", ["30"], { stdio: "ignore" });
+		try {
+			await once(child, "spawn");
+			// `ps` itself is also a new child of this process.
+			const found = newChildren(await readProcessTable(), process.pid, baseline);
+			assert.deepEqual(
+				found.filter((p) => p.pid === child.pid),
+				[{ pid: child.pid, command: "sleep 30" }],
+			);
+		} finally {
+			child.kill();
+		}
 	});
 });
 
@@ -55,7 +83,9 @@ describe("idle helpers", () => {
 class FakeBackend implements PiBackend {
 	readonly mode = "rpc";
 	readonly pis: FakePi[] = [];
-	background: number[] = [];
+	background: BackgroundProcess[] = [];
+	/** When set, reading the process table fails. */
+	tableError = false;
 	/** When false, agents look like live TUI sessions, which the host never stops. */
 	suspendable = true;
 	readonly #dir: string;
@@ -92,7 +122,12 @@ class FakeBackend implements PiBackend {
 		const [host, pi] = channelPair();
 		this.pis.push(new FakePi(pi));
 		return connectRpcAgent(host, silentLogger, {
-			backgroundProcesses: this.suspendable ? async () => this.background : undefined,
+			backgroundProcesses: this.suspendable
+				? async () => {
+						if (this.tableError) throw new Error("ps failed");
+						return this.background;
+					}
+				: undefined,
 		});
 	}
 
@@ -118,6 +153,7 @@ describe("idle sessions", () => {
 	beforeEach(() => {
 		backend.background = [];
 		backend.suspendable = true;
+		backend.tableError = false;
 	});
 	after(async () => {
 		client.close();
@@ -170,13 +206,95 @@ describe("idle sessions", () => {
 	test("keeps a pi with background processes", async () => {
 		await session();
 		const pi = backend.pis.at(-1)!;
-		backend.background = [4242];
+		backend.background = [{ pid: 4242, command: "sleep 60" }];
 		clock += TIMEOUT;
 		await host.suspendIdleSessions();
 		assert.equal(pi.channel.closed, false);
 		backend.background = [];
 		await host.suspendIdleSessions();
 		assert.equal(pi.channel.closed, true);
+	});
+
+	test("keeps a pi whose process table cannot be read", async () => {
+		await session();
+		const pi = backend.pis.at(-1)!;
+		backend.tableError = true;
+		clock += TIMEOUT;
+		await host.suspendIdleSessions();
+		assert.equal(pi.channel.closed, false);
+		backend.tableError = false;
+		await host.suspendIdleSessions();
+		assert.equal(pi.channel.closed, true);
+	});
+
+	test("publishes background processes as the chat's background work and in the summary", async () => {
+		const { session: uri, chat } = await session();
+		const changed = (count: number | undefined) =>
+			client.waitFor(
+				(m) =>
+					m.method === "root/sessionSummaryChanged" &&
+					m.params.session === uri &&
+					m.params.changes._meta !== undefined &&
+					m.params.changes._meta[BACKGROUND_WORK_META] === count,
+			);
+
+		backend.background = [{ pid: 4242, command: "npm run dev" }];
+		await host.refreshBackgroundWork();
+		await client.waitFor((m) => m.params?.action?.type === "chat/backgroundWorkSet" && m.params.channel === chat);
+		assert.deepEqual(client.chats.get(chat)!.backgroundWork, [
+			{
+				kind: "shell",
+				id: "process:4242",
+				label: "npm run dev",
+				command: "npm run dev",
+				startedAt: new Date(clock).toISOString(),
+				_meta: { pid: 4242 },
+			},
+		]);
+		await changed(1);
+		const list = await client.request("listSessions", { channel: "ahp-root://" });
+		const listed = list.items.find((item: { resource: string }) => item.resource === uri);
+		assert.deepEqual(listed._meta, { [BACKGROUND_WORK_META]: 1 });
+
+		// A failed read keeps what was published.
+		backend.tableError = true;
+		await host.refreshBackgroundWork();
+		assert.equal(client.chats.get(chat)!.backgroundWork?.length, 1);
+		backend.tableError = false;
+
+		backend.background = [];
+		await host.refreshBackgroundWork();
+		await client.waitFor((m) => m.params?.action?.type === "chat/backgroundWorkRemoved" && m.params.channel === chat);
+		assert.deepEqual(client.chats.get(chat)!.backgroundWork, []);
+		await changed(undefined);
+	});
+
+	test("does not publish processes that start during a turn until it ends", async () => {
+		const { chat } = await session();
+		const pi = backend.pis.at(-1)!;
+		const events = runEvents("Long task", "Done");
+		pi.emit(events.slice(0, 3));
+		await client.waitFor((m) => m.params?.action?.type === "chat/turnStarted" && m.params.channel === chat);
+		backend.background = [{ pid: 5151, command: "npm test" }];
+		await host.refreshBackgroundWork();
+		assert.equal(client.chats.get(chat)!.backgroundWork?.length ?? 0, 0, "a tool the turn waits on");
+
+		pi.emit(events.slice(3));
+		await client.waitFor((m) => m.params?.action?.type === "chat/turnComplete" && m.params.channel === chat);
+		await host.refreshBackgroundWork();
+		await client.waitFor((m) => m.params?.action?.type === "chat/backgroundWorkSet" && m.params.channel === chat);
+		assert.equal(client.chats.get(chat)!.backgroundWork?.length, 1, "still running after the turn");
+		backend.background = [];
+		await host.refreshBackgroundWork();
+		await client.waitFor((m) => m.params?.action?.type === "chat/backgroundWorkRemoved" && m.params.channel === chat);
+	});
+
+	test("never reads a pi terminal's processes", async () => {
+		backend.suspendable = false;
+		const { chat } = await session();
+		backend.background = [{ pid: 6161, command: "sleep 60" }];
+		await host.refreshBackgroundWork();
+		assert.equal(client.chats.get(chat)!.backgroundWork?.length ?? 0, 0);
 	});
 
 	test("keeps a pi while a run typed in the terminal is in progress", async () => {

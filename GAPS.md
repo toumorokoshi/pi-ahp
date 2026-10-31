@@ -36,6 +36,12 @@ See [specs/archived-sessions.md](specs/archived-sessions.md).
   - A helper process an extension starts lazily on the first turn (for example an MCP server started on first use) counts as background work, so that pi is never stopped.
   - Not tested on Windows (`ps` is used to read the process table; if it fails, nothing is stopped).
   - Embedded mode keeps idle sessions in memory.
+- **Background work** (rpc): see [specs/background-work.md](specs/background-work.md).
+  - Only pi's direct children are seen. A job pi's `bash` tool backgrounds with `&` (or `nohup`) is reparented when that shell exits and is not reported; jobs an extension keeps (such as `bash_bg`) are.
+  - Every process is a `shell` entry. Subagents are not told apart (no `subagent` entries with their own chat), and no entry has a `terminal` with its output.
+  - `startedAt` is when the host first saw the process, up to 5 s late, or when the turn that started it ended.
+  - Nothing is reported for embedded sessions or pi terminals: their children are the host's or the terminal's own.
+  - Each refresh runs `ps` once per running pi, every 5 s and at each turn start and end.
 - **Extension dialogs are not forwarded (rpc):** pi sends them over RPC, but the host dismisses them. They could be mapped to AHP input requests.
 - **Dialog dismissal is untested:** no test drives an extension that opens a dialog in an RPC child.
 - **Model list cache (rpc):** models are cached for 30 s, so a provider added in pi shows up after that.

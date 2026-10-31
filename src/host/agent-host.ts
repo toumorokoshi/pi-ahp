@@ -64,6 +64,13 @@ export interface AgentHostOptions {
 	 * activity (see specs/idle-sessions.md). 0 or unset keeps them running.
 	 */
 	idleTimeoutMs?: number;
+	/**
+	 * How often to publish the processes each running `pi --mode rpc` started
+	 * in the background as its chat's background work (see
+	 * specs/background-work.md). 0 or unset only refreshes when a turn starts
+	 * or ends, and on `refreshBackgroundWork()`.
+	 */
+	backgroundWorkIntervalMs?: number;
 	/** The clock, in ms (tests replace it). */
 	now?: () => number;
 	/** Persisted archived flags. Kept in memory when unset. */
@@ -123,6 +130,9 @@ export class AgentHost implements ConnectionHandler, SessionHostContext, LiveSes
 	readonly #idleTimeoutMs: number;
 	readonly #idleTimer: NodeJS.Timeout | undefined;
 	#sweeping: Promise<number> | undefined;
+	readonly #backgroundTimer: NodeJS.Timeout | undefined;
+	#refreshing: Promise<void> | undefined;
+	#nextRefresh: Promise<void> | undefined;
 	readonly now: () => number;
 	readonly archive: ArchiveStore;
 
@@ -137,6 +147,11 @@ export class AgentHost implements ConnectionHandler, SessionHostContext, LiveSes
 		if (this.#idleTimeoutMs > 0) {
 			this.#idleTimer = setInterval(() => void this.suspendIdleSessions(), sweepInterval(this.#idleTimeoutMs));
 			this.#idleTimer.unref();
+		}
+		const backgroundWorkIntervalMs = options.backgroundWorkIntervalMs ?? 0;
+		if (backgroundWorkIntervalMs > 0) {
+			this.#backgroundTimer = setInterval(() => void this.refreshBackgroundWork(), backgroundWorkIntervalMs);
+			this.#backgroundTimer.unref();
 		}
 		this.store = new StateStore({
 			agents: [
@@ -234,9 +249,43 @@ export class AgentHost implements ConnectionHandler, SessionHostContext, LiveSes
 		return stopped;
 	}
 
+	/**
+	 * Publishes every session's background processes as its chat's
+	 * background work. Only sessions with a running pi are read; none is
+	 * started. A call made while a refresh runs waits for it and then
+	 * refreshes once more, so what it sees is current; calls made meanwhile
+	 * share that next refresh.
+	 */
+	refreshBackgroundWork(): Promise<void> {
+		this.#nextRefresh ??= (this.#refreshing ?? Promise.resolve()).then(() => {
+			this.#nextRefresh = undefined;
+			this.#refreshing = this.#refreshAll().finally(() => {
+				this.#refreshing = undefined;
+			});
+			return this.#refreshing;
+		});
+		return this.#nextRefresh;
+	}
+
+	async #refreshAll(): Promise<void> {
+		await Promise.all(
+			[...this.#sessions.values()].map((session) =>
+				session.refreshBackgroundWork().catch((error) => {
+					this.logger.warn("could not refresh background work", {
+						session: session.id,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}),
+			),
+		);
+	}
+
 	async dispose(): Promise<void> {
 		if (this.#idleTimer) clearInterval(this.#idleTimer);
+		if (this.#backgroundTimer) clearInterval(this.#backgroundTimer);
 		await this.#sweeping?.catch(() => {});
+		await this.#nextRefresh?.catch(() => {});
+		await this.#refreshing?.catch(() => {});
 		for (const connection of this.#connections) connection.close();
 		this.#connections.clear();
 		await Promise.all([...this.#sessions.values()].map((session) => session.dispose()));
@@ -287,6 +336,8 @@ export class AgentHost implements ConnectionHandler, SessionHostContext, LiveSes
 	}
 
 	activityChanged(): void {
+		// A turn that ended may have left processes running.
+		void this.refreshBackgroundWork();
 		const active = [...this.#sessions.values()].filter((session) => session.isRunning).length;
 		if (active === this.#activeSessions) return;
 		this.#activeSessions = active;

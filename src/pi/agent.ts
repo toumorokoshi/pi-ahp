@@ -9,6 +9,7 @@ import type {
 	SlashCommandInfo,
 } from "@earendil-works/pi-coding-agent";
 import type { PiModel, ThinkingLevel } from "./models.ts";
+import type { BackgroundProcess } from "./processes.ts";
 
 /**
  * How the host runs pi:
@@ -74,11 +75,12 @@ export interface PiAgent {
 	commands(): Promise<readonly SlashCommandInfo[]>;
 	/**
 	 * Set only on agents the host may stop when idle (its own `pi --mode rpc`
-	 * children). Resolves with the pids of processes pi started after it
-	 * became ready, such as background jobs or subagents; while there are
-	 * any, the agent is kept.
+	 * children). Resolves with the processes pi started after it became
+	 * ready, such as background jobs or subagents; while there are any, the
+	 * agent is kept, and they are published as the chat's background work.
+	 * Rejects when the process table cannot be read.
 	 */
-	readonly backgroundProcesses?: () => Promise<number[]>;
+	readonly backgroundProcesses?: () => Promise<BackgroundProcess[]>;
 	dispose(): Promise<void>;
 }
 

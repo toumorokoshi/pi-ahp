@@ -3,6 +3,7 @@ import type { Logger } from "../core/logger.ts";
 import type { PiAgent, PiEvent, PromptInput } from "./agent.ts";
 import { RESUME_COMMAND, TRUNCATE_COMMAND } from "./extensions/ahp-resume.ts";
 import type { ThinkingLevel } from "./models.ts";
+import type { BackgroundProcess } from "./processes.ts";
 import type { RpcChannel, RpcCommand, RpcRecord } from "./rpc-channel.ts";
 import { branchTo, type EntryLike, truncationTarget } from "./truncation.ts";
 
@@ -17,9 +18,9 @@ export interface RpcState {
 export interface RpcAgentOptions {
 	/**
 	 * Set for a `pi --mode rpc` child the host started, which it may stop when
-	 * idle. Resolves with the pids of processes pi started in the background.
+	 * idle. Resolves with the processes pi started in the background.
 	 */
-	backgroundProcesses?: () => Promise<number[]>;
+	backgroundProcesses?: () => Promise<BackgroundProcess[]>;
 }
 
 /** Reads pi's state over `channel` and returns an agent for it. Closes the channel on failure. */
@@ -70,7 +71,7 @@ export class RpcAgent implements PiAgent {
 	readonly #settleWaiters = new Set<SettleWaiter>();
 	#model: { provider: string; id: string } | undefined;
 	#thinkingLevel: string | undefined;
-	readonly backgroundProcesses: (() => Promise<number[]>) | undefined;
+	readonly backgroundProcesses: (() => Promise<BackgroundProcess[]>) | undefined;
 
 	constructor(
 		child: RpcChannel,
